@@ -8,53 +8,40 @@
 package view
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"html/template"
 	"path/filepath"
+	"reflect"
 	"strings"
-	"sync"
 
 	"aahframework.org/config.v0"
 	"aahframework.org/essentials.v0"
+	"aahframework.org/log.v0"
 )
 
 var (
 	// TemplateFuncMap aah framework Go template function map.
 	TemplateFuncMap = make(template.FuncMap)
 
-	viewEngines    = make(map[string]Enginer)
-	commonTemplate = &CommonTemplate{}
+	// DefaultDelimiter template default delimiter
+	DefaultDelimiter = "{{.}}"
+
+	viewEngines = make(map[string]Enginer)
 )
 
 // view error messages
 var (
 	ErrTemplateEngineIsNil = errors.New("view: engine value is nil")
 	ErrTemplateNotFound    = errors.New("view: template not found")
+	ErrTemplateKeyExists   = errors.New("view: template key exists")
 )
 
-type (
-	// Enginer interface defines a methods for pluggable view engine.
-	Enginer interface {
-		Init(appCfg *config.Config, baseDir string) error
-		Get(layout, path, tmplName string) (*template.Template, error)
-	}
-
-	// CommonTemplate holds the implementation of common templates which can
-	// be imported via template function `import "name.ext" .`.
-	CommonTemplate struct {
-		templates *template.Template
-		bufPool   *sync.Pool
-	}
-
-	// Templates hold template reference of lowercase key and case sensitive key
-	// with reference to compliled template.
-	Templates struct {
-		TemplateLower map[string]*template.Template
-		Template      map[string]*template.Template
-	}
-)
+// Enginer interface defines a methods for pluggable view engine.
+type Enginer interface {
+	Init(appCfg *config.Config, baseDir string) error
+	Get(layout, path, tmplName string) (*template.Template, error)
+}
 
 //‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
 // Package methods
@@ -86,74 +73,188 @@ func AddEngine(name string, engine Enginer) error {
 // GetEngine method returns the view engine from store by name otherwise nil.
 func GetEngine(name string) (Enginer, bool) {
 	if engine, found := viewEngines[name]; found {
-		return engine, found
+		ty := reflect.TypeOf(engine)
+		return reflect.New(ty.Elem()).Interface().(Enginer), found
 	}
 	return nil, false
 }
 
-// TemplateKey returns the unique key for given path.
-func TemplateKey(path string) string {
-	path = path[strings.Index(path, "pages"):]
-	if fSeparator == '/' {
-		path = strings.Replace(path, "/", "_", -1)
-	} else {
-		path = strings.Replace(path, "\\", "_", -1)
+//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+// type Templates, methods
+//___________________________________
+
+// Templates hold template reference of lowercase key and case sensitive key
+// with reference to compliled template.
+type Templates struct {
+	set map[string]*template.Template
+}
+
+// Get method return the template for given key.
+func (t *Templates) Lookup(key string) *template.Template {
+	return t.set[key]
+}
+
+// Add method adds the given template for the key.
+func (t *Templates) Add(key string, tmpl *template.Template) error {
+	if t.IsExists(key) {
+		return ErrTemplateKeyExists
 	}
 
-	return path
+	if t.set == nil {
+		t.set = make(map[string]*template.Template)
+	}
+
+	t.set[key] = tmpl
+	return nil
+}
+
+// IsExists method returns true if template key exists otherwise false.
+func (t *Templates) IsExists(key string) bool {
+	if _, found := t.set[key]; found {
+		return found
+	}
+	return false
+}
+
+// Keys method returns all the template keys.
+func (t *Templates) Keys() []string {
+	var keys []string
+	for k := range t.set {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 //‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
-// CommonTemplate methods
+// type EngineBase, methods
 //___________________________________
 
-// Init method initializes the common templates which can be imported via
-// template function `import "name.ext" .`.
-func (c *CommonTemplate) Init(cfg *config.Config, baseDir string) error {
-	commonBaseDir := filepath.Join(baseDir, "common")
-	if !ess.IsFileExists(commonBaseDir) {
-		return nil
-	}
-
-	c.bufPool = &sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
-
-	viewFileExt := cfg.StringDefault("view.ext", ".html")
-	commons, err := filepath.Glob(filepath.Join(commonBaseDir, "*"+viewFileExt))
-	if err != nil {
-		return err
-	}
-
-	c.templates, err = template.New("common").Funcs(TemplateFuncMap).ParseFiles(commons...)
-	return err
+// EngineBase struct is to create common and repurpose the implementation.
+// Could used for custom view implementation.
+type EngineBase struct {
+	Name            string
+	AppConfig       *config.Config
+	BaseDir         string
+	Templates       map[string]*Templates
+	FileExt         string
+	CaseSensitive   bool
+	IsLayoutEnabled bool
+	LeftDelim       string
+	RightDelim      string
+	AntiCSRFField   *AntiCSRFField
 }
 
-// Execute method does lookup of common template and renders it. It returns
-// template output otherwise empty string with error.
-func (c *CommonTemplate) Execute(name string, viewArgs map[string]interface{}) (string, error) {
-	tmpl := c.templates.Lookup(name)
-	if tmpl == nil {
-		return "", fmt.Errorf("commontemplate: template not found: %s", name)
+// Init method is to initialize the base fields values.
+func (eb *EngineBase) Init(appCfg *config.Config, baseDir, defaultEngineName, defaultFileExt string) error {
+	if appCfg == nil {
+		return fmt.Errorf("view: app config is nil")
 	}
 
-	buf := c.acquireBuffer()
-	defer c.releaseBuffer(buf)
+	eb.Name = appCfg.StringDefault("view.engine", defaultEngineName)
 
-	if err := tmpl.Execute(buf, viewArgs); err != nil {
-		return "", err
+	// check base directory
+	if !ess.IsFileExists(baseDir) {
+		return fmt.Errorf("%sviewengine: views base dir is not exists: %s", eb.Name, baseDir)
 	}
 
-	return buf.String(), nil
+	eb.Templates = make(map[string]*Templates)
+	eb.AppConfig = appCfg
+	eb.BaseDir = baseDir
+	eb.FileExt = appCfg.StringDefault("view.ext", defaultFileExt)
+	eb.CaseSensitive = appCfg.BoolDefault("view.case_sensitive", false)
+	eb.IsLayoutEnabled = appCfg.BoolDefault("view.default_layout", true)
+
+	delimiter := strings.Split(appCfg.StringDefault("view.delimiters", DefaultDelimiter), ".")
+	if len(delimiter) != 2 || ess.IsStrEmpty(delimiter[0]) || ess.IsStrEmpty(delimiter[1]) {
+		return fmt.Errorf("%sviewengine: config 'view.delimiters' value is invalid", eb.Name)
+	}
+	eb.LeftDelim, eb.RightDelim = delimiter[0], delimiter[1]
+
+	// Anti CSRF
+	eb.AntiCSRFField = NewAntiCSRFField("go", eb.LeftDelim, eb.RightDelim)
+	return nil
 }
 
-//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
-// CommonTemplate unexported methods
-//___________________________________
+// Get method returns the template based given name if found, otherwise nil.
+func (eb *EngineBase) Get(layout, path, tmplName string) (*template.Template, error) {
+	if ess.IsStrEmpty(layout) {
+		layout = noLayout
+	}
 
-func (c *CommonTemplate) acquireBuffer() *bytes.Buffer {
-	return c.bufPool.Get().(*bytes.Buffer)
+	if tmpls, found := eb.Templates[layout]; found {
+		key := filepath.Join(path, tmplName)
+		if layout == noLayout {
+			key = noLayout + "-" + key
+		}
+
+		if !eb.CaseSensitive {
+			key = strings.ToLower(key)
+		}
+
+		if t := tmpls.Lookup(key); t != nil {
+			return t, nil
+		}
+	}
+
+	return nil, ErrTemplateNotFound
 }
 
-func (c *CommonTemplate) releaseBuffer(buf *bytes.Buffer) {
-	buf.Reset()
-	c.bufPool.Put(buf)
+// AddTemplate method adds the given template for layout and key.
+func (eb *EngineBase) AddTemplate(layout, key string, tmpl *template.Template) error {
+	if eb.Templates[layout] == nil {
+		eb.Templates[layout] = &Templates{}
+	}
+	return eb.Templates[layout].Add(key, tmpl)
+}
+
+// ParseErrors method to parse and log the template error messages.
+func (eb *EngineBase) ParseErrors(errs []error) error {
+	if len(errs) > 0 {
+		var msg []string
+		for _, e := range errs {
+			msg = append(msg, e.Error())
+		}
+		log.Errorf("View templates parsing error(s):\n    %s", strings.Join(msg, "\n    "))
+		return errors.New(eb.Name + "viewengine: error processing templates, please check the log")
+	}
+	return nil
+}
+
+// LayoutFiles method returns the all layout files from `<view-base-dir>/layouts`.
+// If layout directory doesn't exists it returns error.
+func (eb *EngineBase) LayoutFiles() ([]string, error) {
+	baseDir := filepath.Join(eb.BaseDir, "layouts")
+	if !ess.IsFileExists(baseDir) {
+		return nil, fmt.Errorf("%sviewengine: layouts base dir is not exists: %s", eb.Name, baseDir)
+	}
+
+	return filepath.Glob(filepath.Join(baseDir, "*"+eb.FileExt))
+}
+
+// DirsPath method returns all sub directories from `<view-base-dir>/<sub-dir-name>`.
+// if it not exists returns error.
+func (eb *EngineBase) DirsPath(subDir string) ([]string, error) {
+	baseDir := filepath.Join(eb.BaseDir, subDir)
+	if !ess.IsFileExists(baseDir) {
+		return nil, fmt.Errorf("%sviewengine: %s base dir is not exists: %s", eb.Name, subDir, baseDir)
+	}
+
+	return ess.DirsPath(baseDir, true)
+}
+
+// FilesPath method returns all file path from `<view-base-dir>/<sub-dir-name>`.
+// if it not exists returns error.
+func (eb *EngineBase) FilesPath(subDir string) ([]string, error) {
+	baseDir := filepath.Join(eb.BaseDir, subDir)
+	if !ess.IsFileExists(baseDir) {
+		return nil, fmt.Errorf("%sviewengine: %s base dir is not exists: %s", eb.Name, subDir, baseDir)
+	}
+
+	return ess.FilesPath(baseDir, true)
+}
+
+// NewTemplate method return new instance on `template.Template` initialized with
+// key, template funcs and delimiters.
+func (eb *EngineBase) NewTemplate(key string) *template.Template {
+	return template.New(key).Funcs(TemplateFuncMap).Delims(eb.LeftDelim, eb.RightDelim)
 }
