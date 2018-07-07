@@ -1,5 +1,5 @@
 // Copyright (c) Jeevanandam M. (https://github.com/jeevatkm)
-// go-aah/view source code and usage is governed by a MIT style
+// aahframework.org/view source code and usage is governed by a MIT style
 // license that can be found in the LICENSE file.
 
 package view
@@ -7,14 +7,14 @@ package view
 import (
 	"bytes"
 	"html/template"
-	"io/ioutil"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"aahframework.org/config.v0"
-	"aahframework.org/essentials.v0"
 	"aahframework.org/log.v0"
+	"aahframework.org/vfs.v0"
 )
 
 const noLayout = "nolayout"
@@ -24,9 +24,9 @@ var (
 	bufPool         *sync.Pool
 )
 
-//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
 // type GoViewEngine and its method
-//___________________________________
+//______________________________________________________________________________
 
 // GoViewEngine implements the partial inheritance support with Go templates.
 type GoViewEngine struct {
@@ -35,19 +35,20 @@ type GoViewEngine struct {
 
 // Init method initialize a template engine with given aah application config
 // and application views base path.
-func (e *GoViewEngine) Init(appCfg *config.Config, baseDir string) error {
+func (e *GoViewEngine) Init(fs *vfs.VFS, appCfg *config.Config, baseDir string) error {
 	if e.EngineBase == nil {
-		e.EngineBase = &EngineBase{}
+		e.EngineBase = new(EngineBase)
 	}
 
-	if err := e.EngineBase.Init(appCfg, baseDir, "go", ".html"); err != nil {
+	if err := e.EngineBase.Init(fs, appCfg, baseDir, "go", ".html"); err != nil {
 		return err
 	}
 
 	// Add template func
 	AddTemplateFunc(template.FuncMap{
-		"import":  tmplInclude,
-		"include": tmplInclude, // alias for import
+		"safeHTML": e.tmplSafeHTML,
+		"import":   e.tmplInclude,
+		"include":  e.tmplInclude, // alias for import
 	})
 
 	// load common templates
@@ -71,7 +72,7 @@ func (e *GoViewEngine) Init(appCfg *config.Config, baseDir string) error {
 		_ = e.loadNonLayoutTemplates("pages")
 	}
 
-	if ess.IsFileExists(filepath.Join(e.BaseDir, "errors")) {
+	if e.VFS.IsExists(filepath.Join(e.BaseDir, "errors")) {
 		if err = e.loadNonLayoutTemplates("errors"); err != nil {
 			return err
 		}
@@ -80,9 +81,9 @@ func (e *GoViewEngine) Init(appCfg *config.Config, baseDir string) error {
 	return nil
 }
 
-//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
 // GoViewEngine unexported methods
-//___________________________________
+//______________________________________________________________________________
 
 func (e *GoViewEngine) loadCommonTemplates() error {
 	commons, err := e.FilesPath("common")
@@ -92,27 +93,19 @@ func (e *GoViewEngine) loadCommonTemplates() error {
 
 	commonTemplates = &Templates{}
 	bufPool = &sync.Pool{New: func() interface{} { return &bytes.Buffer{} }}
-	prefix := filepath.Dir(e.BaseDir)
+	prefix := path.Dir(e.BaseDir)
 	for _, file := range commons {
 		if !strings.HasSuffix(file, e.FileExt) {
 			log.Warnf("goviewengine: not a valid template extension[%s]: %s", e.FileExt, TrimPathPrefix(prefix, file))
 			continue
 		}
 
-		tmplKey := StripPathPrefixAt(filepath.ToSlash(file), "views/")
-		tmpl := e.NewTemplate(tmplKey)
-
-		tbytes, err := ioutil.ReadFile(file)
+		log.Tracef("Parsing file: %s", TrimPathPrefix(prefix, file))
+		tmpl, err := e.ParseFile(file)
 		if err != nil {
 			return err
 		}
-
-		tstr := e.AntiCSRFField.InsertOnString(string(tbytes))
-		if tmpl, err = tmpl.Parse(tstr); err != nil {
-			return err
-		}
-
-		if err = commonTemplates.Add(tmplKey, tmpl); err != nil {
+		if err = commonTemplates.Add(tmpl.Name(), tmpl); err != nil {
 			return err
 		}
 	}
@@ -126,30 +119,28 @@ func (e *GoViewEngine) loadLayoutTemplates(layouts []string) error {
 		return err
 	}
 
-	prefix := filepath.Dir(e.BaseDir)
+	prefix := path.Dir(e.BaseDir)
 	var errs []error
 	for _, layout := range layouts {
-		layoutKey := strings.ToLower(filepath.Base(layout))
+		layoutKey := strings.ToLower(path.Base(layout))
 
 		for _, dir := range dirs {
-			files, err := filepath.Glob(filepath.Join(dir, "*"+e.FileExt))
+			files, err := e.VFS.Glob(path.Join(dir, "*"+e.FileExt))
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
 
 			for _, file := range files {
-				tfiles := []string{layout, file}
 				tmplKey := StripPathPrefixAt(filepath.ToSlash(file), "views/")
 				tmpl := e.NewTemplate(tmplKey)
-				tmplfiles := e.AntiCSRFField.InsertOnFiles(tfiles...)
+				tfiles := []string{layout, file}
 
 				log.Tracef("Parsing files: %s", TrimPathPrefix(prefix, tfiles...))
-				if tmpl, err = tmpl.ParseFiles(tmplfiles...); err != nil {
+				if _, err = e.ParseFiles(tmpl, tfiles...); err != nil {
 					errs = append(errs, err)
 					continue
 				}
-
 				if err = e.AddTemplate(layoutKey, tmplKey, tmpl); err != nil {
 					errs = append(errs, err)
 					continue
@@ -167,10 +158,10 @@ func (e *GoViewEngine) loadNonLayoutTemplates(scope string) error {
 		return err
 	}
 
-	prefix := filepath.Dir(e.BaseDir)
+	prefix := path.Dir(e.BaseDir)
 	var errs []error
 	for _, dir := range dirs {
-		files, err := filepath.Glob(filepath.Join(dir, "*"+e.FileExt))
+		files, err := e.VFS.Glob(path.Join(dir, "*"+e.FileExt))
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -179,11 +170,13 @@ func (e *GoViewEngine) loadNonLayoutTemplates(scope string) error {
 		for _, file := range files {
 			tmplKey := noLayout + "-" + StripPathPrefixAt(filepath.ToSlash(file), "views/")
 			tmpl := e.NewTemplate(tmplKey)
-			fileBytes, _ := ioutil.ReadFile(file)
-			fileStr := e.AntiCSRFField.InsertOnString(string(fileBytes))
 
 			log.Tracef("Parsing file: %s", TrimPathPrefix(prefix, file))
-			if tmpl, err = tmpl.Parse(fileStr); err != nil {
+			tstr, err := e.Open(file)
+			if err != nil {
+				return err
+			}
+			if tmpl, err = tmpl.Parse(tstr); err != nil {
 				errs = append(errs, err)
 				continue
 			}
@@ -200,9 +193,4 @@ func (e *GoViewEngine) loadNonLayoutTemplates(scope string) error {
 
 func init() {
 	_ = AddEngine("go", &GoViewEngine{})
-
-	// Add template func
-	AddTemplateFunc(template.FuncMap{
-		"safeHTML": tmplSafeHTML,
-	})
 }

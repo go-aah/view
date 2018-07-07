@@ -1,5 +1,5 @@
 // Copyright (c) Jeevanandam M. (https://github.com/jeevatkm)
-// go-aah/view source code and usage is governed by a MIT style
+// aahframework.org/view source code and usage is governed by a MIT style
 // license that can be found in the LICENSE file.
 
 // Package view is implementation of aah framework view engine using Go
@@ -11,13 +11,15 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"path"
 	"path/filepath"
-	"reflect"
+	"regexp"
 	"strings"
 
 	"aahframework.org/config.v0"
 	"aahframework.org/essentials.v0"
 	"aahframework.org/log.v0"
+	"aahframework.org/vfs.v0"
 )
 
 var (
@@ -39,13 +41,13 @@ var (
 
 // Enginer interface defines a methods for pluggable view engine.
 type Enginer interface {
-	Init(appCfg *config.Config, baseDir string) error
+	Init(fs *vfs.VFS, appCfg *config.Config, baseDir string) error
 	Get(layout, path, tmplName string) (*template.Template, error)
 }
 
-//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
 // Package methods
-//___________________________________
+//______________________________________________________________________________
 
 // AddTemplateFunc method adds given Go template funcs into function map.
 func AddTemplateFunc(funcMap template.FuncMap) {
@@ -72,16 +74,13 @@ func AddEngine(name string, engine Enginer) error {
 
 // GetEngine method returns the view engine from store by name otherwise nil.
 func GetEngine(name string) (Enginer, bool) {
-	if engine, found := viewEngines[name]; found {
-		ty := reflect.TypeOf(engine)
-		return reflect.New(ty.Elem()).Interface().(Enginer), found
-	}
-	return nil, false
+	engine, found := viewEngines[name]
+	return engine, found
 }
 
-//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
 // type Templates, methods
-//___________________________________
+//______________________________________________________________________________
 
 // Templates hold template reference of lowercase key and case sensitive key
 // with reference to compliled template.
@@ -89,7 +88,7 @@ type Templates struct {
 	set map[string]*template.Template
 }
 
-// Get method return the template for given key.
+// Lookup method return the template for given key.
 func (t *Templates) Lookup(key string) *template.Template {
 	return t.set[filepath.ToSlash(key)]
 }
@@ -125,35 +124,38 @@ func (t *Templates) Keys() []string {
 	return keys
 }
 
-//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
-// type EngineBase, methods
-//___________________________________
+//‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+// type EngineBase, its methods
+//______________________________________________________________________________
 
 // EngineBase struct is to create common and repurpose the implementation.
-// Could used for custom view implementation.
+// Could be used for custom view engine implementation.
 type EngineBase struct {
-	Name            string
-	AppConfig       *config.Config
-	BaseDir         string
-	Templates       map[string]*Templates
-	FileExt         string
 	CaseSensitive   bool
 	IsLayoutEnabled bool
+	hotReload       bool
+	Name            string
+	BaseDir         string
+	FileExt         string
 	LeftDelim       string
 	RightDelim      string
-	AntiCSRFField   *AntiCSRFField
+	AppConfig       *config.Config
+	Templates       map[string]*Templates
+	VFS             *vfs.VFS
+	loginFormRegex  *regexp.Regexp
 }
 
 // Init method is to initialize the base fields values.
-func (eb *EngineBase) Init(appCfg *config.Config, baseDir, defaultEngineName, defaultFileExt string) error {
+func (eb *EngineBase) Init(fs *vfs.VFS, appCfg *config.Config, baseDir, defaultEngineName, defaultFileExt string) error {
 	if appCfg == nil {
 		return fmt.Errorf("view: app config is nil")
 	}
 
+	eb.VFS = fs
 	eb.Name = appCfg.StringDefault("view.engine", defaultEngineName)
 
 	// check base directory
-	if !ess.IsFileExists(baseDir) {
+	if !eb.VFS.IsExists(baseDir) {
 		return fmt.Errorf("%sviewengine: views base dir is not exists: %s", eb.Name, baseDir)
 	}
 
@@ -170,19 +172,107 @@ func (eb *EngineBase) Init(appCfg *config.Config, baseDir, defaultEngineName, de
 	}
 	eb.LeftDelim, eb.RightDelim = delimiter[0], delimiter[1]
 
-	// Anti CSRF
-	eb.AntiCSRFField = NewAntiCSRFField("go", eb.LeftDelim, eb.RightDelim)
+	eb.loginFormRegex = regexp.MustCompile(`(<form(.*)_login_submit__aah\"(.*)(?s)>)`)
+
 	return nil
 }
 
+// Open method reads template from VFS if not found resolve from physical
+// file system. Also does auto field insertion such as
+// Anti-CSRF(anti_csrf_token) and requested page URL (_rt).
+func (eb *EngineBase) Open(filename string) (string, error) {
+	b, err := vfs.ReadFile(eb.VFS, filename)
+	if err != nil {
+		return "", err
+	}
+	return eb.AutoFieldInsertion(filename, string(b)), nil
+}
+
+// AutoFieldInsertion method processes the aah view's to auto insert the field.
+func (eb *EngineBase) AutoFieldInsertion(name, v string) string {
+	// process auto field insertion, if form tag exists
+	// anti_csrf_token field
+	if strings.Contains(v, "</form>") {
+		log.Tracef("Adding field 'anti_csrf_token' into all forms: %s", name)
+		fieldName := eb.AppConfig.StringDefault("security.anti_csrf.form_field_name", "anti_csrf_token")
+		v = strings.Replace(v, "</form>", fmt.Sprintf(`<input type="hidden" name="%s" value="%s anticsrftoken . %s">
+	     	</form>`, fieldName, eb.LeftDelim, eb.RightDelim), -1)
+	}
+
+	// _rt field
+	if matches := eb.loginFormRegex.FindAllStringIndex(v, -1); len(matches) > 0 {
+		log.Tracef("Adding field '_rt' into login form: %s", name)
+		for _, m := range matches {
+			ts := v[m[0]:m[1]]
+			v = strings.Replace(v, ts, fmt.Sprintf(`%s
+			<input type="hidden" value="{{ qparam . "_rt" }}" name="_rt">`, ts), 1)
+		}
+	}
+
+	return v
+}
+
+// ParseFile method parses given single file.
+func (eb *EngineBase) ParseFile(filename string) (*template.Template, error) {
+	if !strings.HasPrefix(filename, eb.BaseDir) {
+		filename = path.Join(eb.BaseDir, filename)
+	}
+	tmpl := eb.NewTemplate(StripPathPrefixAt(filepath.ToSlash(filename), "views/"))
+	tstr, err := eb.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	return tmpl.Parse(tstr)
+}
+
+// ParseFiles method parses given files with given template instance.
+func (eb *EngineBase) ParseFiles(t *template.Template, filenames ...string) (*template.Template, error) {
+	for _, filename := range filenames {
+		s, err := eb.Open(filename)
+		if err != nil {
+			return nil, err
+		}
+
+		name := filepath.Base(filename)
+		var tmpl *template.Template
+		if t == nil {
+			t = eb.NewTemplate(name)
+		}
+		if name == t.Name() {
+			tmpl = t
+		} else {
+			tmpl = t.New(name)
+		}
+		if _, err = tmpl.Parse(s); err != nil {
+			return nil, err
+		}
+	}
+
+	return t, nil
+}
+
 // Get method returns the template based given name if found, otherwise nil.
-func (eb *EngineBase) Get(layout, path, tmplName string) (*template.Template, error) {
+func (eb *EngineBase) Get(layout, tpath, tmplName string) (*template.Template, error) {
+	if eb.hotReload && eb.Name == "go" {
+		key := path.Join(tpath, tmplName)
+		if !eb.CaseSensitive {
+			key = strings.ToLower(key)
+		}
+
+		if ess.IsStrEmpty(layout) {
+			return eb.ParseFile(path.Join(eb.BaseDir, key))
+		}
+		return eb.ParseFiles(eb.NewTemplate(key),
+			path.Join(eb.BaseDir, "layouts", layout),
+			path.Join(eb.BaseDir, key))
+	}
+
 	if ess.IsStrEmpty(layout) {
 		layout = noLayout
 	}
 
 	if tmpls, found := eb.Templates[layout]; found {
-		key := filepath.Join(path, tmplName)
+		key := path.Join(tpath, tmplName)
 		if layout == noLayout {
 			key = noLayout + "-" + key
 		}
@@ -197,6 +287,11 @@ func (eb *EngineBase) Get(layout, path, tmplName string) (*template.Template, er
 	}
 
 	return nil, ErrTemplateNotFound
+}
+
+// SetHotReload method set teh view engine mode into hot reload without watcher.
+func (eb *EngineBase) SetHotReload(r bool) {
+	eb.hotReload = r
 }
 
 // AddTemplate method adds the given template for layout and key.
@@ -223,34 +318,32 @@ func (eb *EngineBase) ParseErrors(errs []error) error {
 // LayoutFiles method returns the all layout files from `<view-base-dir>/layouts`.
 // If layout directory doesn't exists it returns error.
 func (eb *EngineBase) LayoutFiles() ([]string, error) {
-	baseDir := filepath.Join(eb.BaseDir, "layouts")
-	if !ess.IsFileExists(baseDir) {
+	baseDir := path.Join(eb.BaseDir, "layouts")
+	if !eb.VFS.IsExists(baseDir) {
 		return nil, fmt.Errorf("%sviewengine: layouts base dir is not exists: %s", eb.Name, baseDir)
 	}
 
-	return filepath.Glob(filepath.Join(baseDir, "*"+eb.FileExt))
+	return eb.VFS.Glob(path.Join(baseDir, "*"+eb.FileExt))
 }
 
 // DirsPath method returns all sub directories from `<view-base-dir>/<sub-dir-name>`.
 // if it not exists returns error.
 func (eb *EngineBase) DirsPath(subDir string) ([]string, error) {
-	baseDir := filepath.Join(eb.BaseDir, subDir)
-	if !ess.IsFileExists(baseDir) {
+	baseDir := path.Join(eb.BaseDir, subDir)
+	if !eb.VFS.IsExists(baseDir) {
 		return nil, fmt.Errorf("%sviewengine: %s base dir is not exists: %s", eb.Name, subDir, baseDir)
 	}
-
-	return ess.DirsPath(baseDir, true)
+	return eb.VFS.Dirs(baseDir)
 }
 
 // FilesPath method returns all file path from `<view-base-dir>/<sub-dir-name>`.
 // if it not exists returns error.
 func (eb *EngineBase) FilesPath(subDir string) ([]string, error) {
-	baseDir := filepath.Join(eb.BaseDir, subDir)
-	if !ess.IsFileExists(baseDir) {
+	baseDir := path.Join(eb.BaseDir, subDir)
+	if !eb.VFS.IsExists(baseDir) {
 		return nil, fmt.Errorf("%sviewengine: %s base dir is not exists: %s", eb.Name, subDir, baseDir)
 	}
-
-	return ess.FilesPath(baseDir, true)
+	return eb.VFS.Files(baseDir)
 }
 
 // NewTemplate method return new instance on `template.Template` initialized with

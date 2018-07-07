@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"html/template"
-	"path/filepath"
+	"io/ioutil"
 	"strings"
 	"testing"
 
@@ -18,9 +18,10 @@ import (
 )
 
 func TestViewAppPages(t *testing.T) {
-	_ = log.SetLevel("trace")
+	// _ = log.SetLevel("trace")
+	log.SetWriter(ioutil.Discard)
 	cfg, _ := config.ParseString(`view { }`)
-	ge := loadGoViewEngine(t, cfg, "views")
+	ge := loadGoViewEngine(t, cfg, "views", false)
 
 	data := map[string]interface{}{
 		"GreetName": "aah framework",
@@ -46,11 +47,12 @@ func TestViewAppPages(t *testing.T) {
 }
 
 func TestViewUserPages(t *testing.T) {
-	_ = log.SetLevel("trace")
+	// _ = log.SetLevel("trace")
+	log.SetWriter(ioutil.Discard)
 	cfg, _ := config.ParseString(`view {
 		delimiters = "{{.}}"
 	}`)
-	ge := loadGoViewEngine(t, cfg, "views")
+	ge := loadGoViewEngine(t, cfg, "views", true)
 
 	data := map[string]interface{}{
 		"GreetName": "aah framework",
@@ -79,12 +81,13 @@ func TestViewUserPages(t *testing.T) {
 }
 
 func TestViewUserPagesNoLayout(t *testing.T) {
-	_ = log.SetLevel("trace")
+	// _ = log.SetLevel("trace")
+	log.SetWriter(ioutil.Discard)
 	cfg, _ := config.ParseString(`view {
 		delimiters = "{{.}}"
 		default_layout = false
 	}`)
-	ge := loadGoViewEngine(t, cfg, "views")
+	ge := loadGoViewEngine(t, cfg, "views", false)
 
 	data := map[string]interface{}{
 		"GreetName": "aah framework",
@@ -105,51 +108,54 @@ func TestViewUserPagesNoLayout(t *testing.T) {
 }
 
 func TestViewBaseDirNotExists(t *testing.T) {
-	viewsDir := filepath.Join(getTestdataPath(), "views1")
+	viewsDir := join("testdata", "views1")
 	ge := &GoViewEngine{}
 	cfg, _ := config.ParseString(`view { }`)
 
-	err := ge.Init(cfg, viewsDir)
+	err := ge.Init(newVFS(), cfg, viewsDir)
 	assert.NotNil(t, err)
 	assert.True(t, strings.HasPrefix(err.Error(), "goviewengine: views base dir is not exists:"))
 }
 
 func TestViewDelimitersError(t *testing.T) {
-	viewsDir := filepath.Join(getTestdataPath(), "views")
+	viewsDir := join("testdata", "views")
 	ge := &GoViewEngine{}
 	cfg, _ := config.ParseString(`view {
 		delimiters = "{{."
 	}`)
 
-	err := ge.Init(cfg, viewsDir)
+	err := ge.Init(newVFS(), cfg, viewsDir)
 	assert.NotNil(t, err)
 	assert.Equal(t, "goviewengine: config 'view.delimiters' value is invalid", err.Error())
 }
 
 func TestViewErrors(t *testing.T) {
-	_ = log.SetLevel("trace")
+	// _ = log.SetLevel("trace")
+	log.SetWriter(ioutil.Discard)
 	cfg, _ := config.ParseString(`view {
 		default_layout = false
 	}`)
 
+	fs := newVFS()
+
 	// No layout directiry
-	viewsDir := filepath.Join(getTestdataPath(), "views-no-layouts-dir")
+	viewsDir := join("testdata", "views-no-layouts-dir")
 	ge := &GoViewEngine{}
-	err := ge.Init(cfg, viewsDir)
+	err := ge.Init(fs, cfg, viewsDir)
 	assert.NotNil(t, err)
 	assert.True(t, strings.HasPrefix(err.Error(), "goviewengine: layouts base dir is not exists:"))
 
 	// No Common directory
-	viewsDir = filepath.Join(getTestdataPath(), "views-no-common-dir")
+	viewsDir = join("testdata", "views-no-common-dir")
 	ge = &GoViewEngine{}
-	err = ge.Init(cfg, viewsDir)
+	err = ge.Init(fs, cfg, viewsDir)
 	assert.NotNil(t, err)
 	assert.True(t, strings.HasPrefix(err.Error(), "goviewengine: common base dir is not exists:"))
 
 	// No Pages directory
-	viewsDir = filepath.Join(getTestdataPath(), "views-no-pages-dir")
+	viewsDir = join("testdata", "views-no-pages-dir")
 	ge = &GoViewEngine{}
-	err = ge.Init(cfg, viewsDir)
+	err = ge.Init(fs, cfg, viewsDir)
 	assert.NotNil(t, err)
 	assert.True(t, strings.HasPrefix(err.Error(), "goviewengine: pages base dir is not exists:"))
 
@@ -159,25 +165,34 @@ func TestViewErrors(t *testing.T) {
 	assert.Equal(t, "goviewengine: error processing templates, please check the log", err.Error())
 }
 
-func loadGoViewEngine(t *testing.T, cfg *config.Config, dir string) *GoViewEngine {
+func loadGoViewEngine(t *testing.T, cfg *config.Config, dir string, hotreload bool) *GoViewEngine {
 	// dummy func for test
 	AddTemplateFunc(template.FuncMap{
-		"anitcsrftoken": func(arg interface{}) string {
+		"anticsrftoken": func(arg interface{}) string {
 			return ""
+		},
+		"rurl": func(args map[string]interface{}, key string) string {
+			return "//localhost:8080/login"
+		},
+		"qparam": func(args map[string]interface{}, key string) string {
+			return "/index"
 		},
 	})
 
-	viewsDir := filepath.Join(getTestdataPath(), dir)
+	viewsDir := join("testdata", dir)
 	ge := &GoViewEngine{}
 
-	err := ge.Init(cfg, viewsDir)
+	err := ge.Init(newVFS(), cfg, viewsDir)
 	assert.FailNowOnError(t, err, "")
+	ge.hotReload = hotreload
 
 	assert.Equal(t, viewsDir, ge.BaseDir)
 	assert.NotNil(t, ge.AppConfig)
 	assert.NotNil(t, ge.Templates)
 
-	assert.NotNil(t, (&EngineBase{}).Init(nil, "", "", ""))
+	assert.NotNil(t, (&EngineBase{}).Init(nil, nil, "", "", ""))
+
+	log.SetWriter(ioutil.Discard)
 
 	return ge
 }
